@@ -5,6 +5,7 @@
 import urllib2
 import time
 import os
+import subprocess
 import errno
 from itertools import count
 import pickle
@@ -19,13 +20,30 @@ def make_sure_path_exists(path):
         if exception.errno != errno.EEXIST:
             raise
 
+# Path passed without .bz2 extension, for symmetry with write_file_bz2
+def read_file_bz2(path):
+    subprocess.call(['bunzip2', '-k', path + '.bz2'])
+    result = read_file(path)
+    os.remove(path)
+    return result
+
 def read_file(path):
     with open(path, 'r') as f:
         return f.read()
 
+def write_file_bz2(path, contents):
+    write_file(path, contents)
+    subprocess.call(['bzip2', path])
+
 def write_file(path, contents):
     with open(path, 'w') as f:
         f.write(contents)
+
+def get_page_filename(initial_letter, pagenum):
+    if pagenum == 1:
+        return 'artists-' + initial_letter + '.html'
+    else:
+        return 'artists-' + initial_letter + '-' + str(pagenum) + '.html'
 
 base_url = 'http://www.metrolyrics.com/'
 make_sure_path_exists('cache')
@@ -37,21 +55,21 @@ for artistpage in artistpages:
     for pagenum in count(1):
         page_filename = get_page_filename(artistpage, pagenum)
         cache_path = 'cache/' + page_filename
-        if not os.path.isfile(cache_path):
+        if not os.path.isfile(cache_path + '.bz2'):
             stdout.write('Retrieving ' + page_filename + '...'); stdout.flush()
             response = urllib2.urlopen(base_url + page_filename)
             html = response.read()
             if page_filename != filename and '(Page: 1)' in html:
                 stdout.write("not found.\n")
-                write_file(cache_path, '') # Avoid re-retrieval later
+                write_file_bz2(cache_path, '') # Avoid re-retrieval later
                 break
-            write_file(cache_path, html)
+            write_file_bz2(cache_path, html)
             stdout.write("done.\n")
             stdout.write('Sleeping for 5 seconds...'); stdout.flush()
             time.sleep(5)
             stdout.write("done.\n")
         else:
-            if read_file(cache_path) == '':
+            if read_file_bz2(cache_path) == '':
                 break
 
 # Extract artists from Browse artists pages
@@ -68,8 +86,8 @@ else:
             cache_path = 'cache/' + page_filename
 
             print 'Parsing ' + page_filename + '.'
-            if os.path.isfile(cache_path):
-                html = read_file(cache_path)
+            if os.path.isfile(cache_path + '.bz2'):
+                html = read_file_bz2(cache_path)
                 soup = BeautifulSoup(html)
                 for artist_list in soup.find_all('ul', class_='artist-list'):
                     artist_links += artist_list.find_all('a')
@@ -83,11 +101,11 @@ else:
 for artist in artists:
     filename = artist['url']
     cache_path = 'cache/' + filename
-    if not os.path.isfile(cache_path):
+    if not os.path.isfile(cache_path + '.bz2'):
         stdout.write('Retrieving ' + filename + '...'); stdout.flush()
         response = urllib2.urlopen(base_url + filename)
         html = response.read()
-        write_file(cache_path, html)
+        write_file_bz2(cache_path, html)
         stdout.write("done.\n")
         stdout.write('Sleeping for 5 seconds...'); stdout.flush()
         time.sleep(5)

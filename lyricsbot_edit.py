@@ -3,6 +3,7 @@
 # (CC0, http://creativecommons.org/publicdomain/zero/1.0/).
 
 import sys
+import subprocess
 import urllib2
 import os
 import time
@@ -17,6 +18,13 @@ def allow_bots(text, user):
         return False
     return True
 
+# Path passed without .bz2 extension, for symmetry with write_file_bz2
+def read_file_bz2(path):
+    subprocess.call(['bunzip2', '-k', path + '.bz2'])
+    result = read_file(path)
+    os.remove(path)
+    return result
+
 def read_file(path):
     with open(path, 'r') as f:
         return f.read()
@@ -24,12 +32,6 @@ def read_file(path):
 def write_file(path, contents):
     with open(path, 'w') as f:
         f.write(contents)
-
-def get_page_filename(initial_letter, pagenum):
-    if pagenum == 1:
-        return 'artists-' + initial_letter + '.html'
-    else:
-        return 'artists-' + initial_letter + '-' + str(pagenum) + '.html'
 
 def get_redirect(site, title):
     page = site.Pages[title]
@@ -122,6 +124,12 @@ def add_to_external_links(site, text, new_entry):
         text = text.replace(insert_text, insert_text + "\n")
     return text
 
+def has_edited_before(page, user):
+    for rev in page.revisions(end='20130000000000', prop='user'):
+        if rev['user'] == user:
+            return True
+    return False
+
 artists_cache_path = 'cache/artists.pickle'
 if not os.path.isfile(artists_cache_path):
     print 'Artists cache file ' + artists_cache_path + ' not found'
@@ -129,6 +137,13 @@ if not os.path.isfile(artists_cache_path):
 
 with open(artists_cache_path, 'r') as f:
     artists = pickle.load(f)
+
+songs_complete_cache_path = 'cache/songs_complete.pickle'
+if os.path.isfile(songs_complete_cache_path):
+    with open(songs_complete_cache_path, 'r') as f:
+        songs_complete = pickle.load(f)
+else:
+    songs_complete = dict()
 
 # Log in as LyricsBot
 site = mwclient.Site('en.wikipedia.org')
@@ -152,20 +167,22 @@ for artist in artists:
     cache_path = 'cache/' + filename
 
     # Extract songs from artist pages
-    html = read_file(cache_path)
+    html = read_file_bz2(cache_path)
     soup = BeautifulSoup(html)
     song_links = [x.find('a') for x in soup.find_all('td', class_='song')]
     songs = [{'url': x['href'][1:], 'title': re.sub(r' Lyrics$', '', x.text.strip())} for x in song_links]
 
     for song in songs:
         song_result_cache_path = 'cache/' + song['url'] + '.result'
-        if os.path.isfile(song_result_cache_path):
+        if songs_complete.has_key(song['url']):
             continue
 
         response = urllib2.urlopen('http://www.metrolyrics.com/' + song['url'])
         html = response.read()
         if 'Our licensing agreement does not allow' in html:
-            write_file(song_result_cache_path, '0')
+            songs_complete[song['url']] = 0
+            with open(songs_complete_cache_path, 'w') as f:
+                pickle.dump(songs_complete, f)
             print 'MetroLyrics does not currently have lyrics of ' + song['title']
             time.sleep(5)
             continue
@@ -201,21 +218,20 @@ for artist in artists:
                 else:
                     title_url = m.group(1)
                     artist_url = m.group(2)
-                    template_page = site.Pages['Template:Lyrics/' + song_article]
-                    if not template_page.exists:
-                        template_page.edit()
-                        text = '* {{MetroLyrics song|' + artist_url + '|' + title_url + '}}'
-                        template_page.save(text, summary="Create with link to full lyrics at MetroLyrics")
-                        print "Saved template page " + template_page.name + " with text: " + text
-                        page = site.Pages[song_article]
+                    page = site.Pages[song_article]
+                    if not has_edited_before(page, 'LyricsBot'):
                         text = page.edit()
                         if not allow_bots(text, 'LyricsBot'):
                             print "LyricsBot forbidden on song page"
+                        elif '{{MetroLyrics' in text or 'metrolyrics.com/' in text:
+                            print "Already contains MetroLyrics link"
                         else:
-                            text = add_to_external_links(site, text, '{{' + template_page.page_title + '}}')
-                        page.save(text, summary="Add external link to full lyrics from legal provider")
-                        print "Inserted external link in [[" + song_article + "]]"
-                        write_file(song_result_cache_path, '1')
-                        sys.exit(0)
+                            text = add_to_external_links(site, text, '* {{MetroLyrics song|' + artist_url + '|' + title_url + '}}')
+                            page.save(text, summary="Add external link to full lyrics from licensed provider (MetroLyrics)")
+                            print "Inserted external link in [[" + song_article + "]]"
+                            songs_complete[song['url']] = 1
+                            with open(songs_complete_cache_path, 'w') as f:
+                                pickle.dump(songs_complete, f)
+                    sys.exit(0)
 
         time.sleep(5)
