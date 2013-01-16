@@ -55,26 +55,56 @@ def is_song(site, title):
     # Guess based on presence of common song-related categories
     return 'songs]]' in text or 'singles]]' in text or 'ballads]]' in text or '[[category:songs' in text.lower()
 
-def confirm_song(site, title, artist):
+def confirm_song(site, title, artist_article, artist_name):
     page = site.Pages[title]
     text = page.edit()
-    m = re.search(r'\| *Artist * = *\[\[([^\|\]]*)(\|.*)?\]\]', text, flags=re.IGNORECASE)
+    m = re.search(r'\| *Artist * = *\[\[([^\|\]]*)(\|([^\]]*))?\]\]', text, flags=re.IGNORECASE)
     if m:
-        return artist == m.group(1).strip()
+        return artist_article.lower() == m.group(1).strip().lower() or \
+               (m.group(3) is not None and artist_name.lower() == m.group(3).strip().lower())
     m = re.search(r'\| *Artist * = *(.*)', text, flags=re.IGNORECASE)
     if m:
-        return artist.lower() == m.group(1).strip().lower()
+        return m.group(1).strip().lower().startswith(artist_name.lower()) or \
+               m.group(1).strip().lower().startswith(artist_article.lower())
     return False
 
 def fix_case(title):
-    for word in ['on', 'in', 'at', 'for', 'to', 'from', 'a', 'the']:
-        title = title.replace(word.capitalize(), word.lower())
-    return title
+    result = ''
+    suffix = title
+    while suffix != '':
+        m = re.match(r'([\w\']*)([^\w\']*)(.*)$', suffix)
+        (prefix, sep, suffix) = (m.group(1), m.group(2), m.group(3))
+        prefix = prefix.capitalize()
+        for word in ['on', 'in', 'at', 'for', 'to', 'from', 'a', 'the', 'of']:
+            if prefix.lower() == word.lower():
+                prefix = word.lower()
+        if result == '' or result.endswith('('):
+            prefix = prefix.capitalize()
+        result += prefix + sep
+    return result
 
 def is_navbox(site, title):
     page = site.Pages[title]
     text = page.edit().lower()
     return '{{navbox' in text or 'navigational boxes|' in text or 'navigational boxes]]' in text or 'list-linking templates|' in text or 'list-linking templates]]' in text
+
+def insert_end_of_not_last_section(text, section_name, insert_text):
+    prev_section_pos = -1
+    matches = re.finditer('^== *' + section_name + ' *== *$', text, flags=re.IGNORECASE | re.MULTILINE)
+    ends = [m.end() for m in matches]
+    # Take first if more than one
+    pos = min(ends) if len(ends) > 0 else 0
+    matches = re.finditer('^(.*)$', text, flags=re.MULTILINE)
+    for m in matches:
+        if m.start() >= pos:
+            line = m.group(1)
+            if line == '':
+                continue
+            if re.match('==(.*)== *$', line):
+                break
+            pos = m.end()
+    
+    return text[0:pos] + insert_text + text[pos:]
 
 def insert_end_of_last_section(site, text, insert_text):
     prev_section_pos = -1
@@ -113,12 +143,20 @@ def insert_end_of_last_section(site, text, insert_text):
     return text[0:pos] + insert_text + text[pos:]
 
 def add_to_external_links(site, text, new_entry):
+    external_links_last = True
     if not re.search('== *External links *==', text, flags=re.IGNORECASE):
         insert_text = "\n\n==External links==\n" + new_entry
     else:
+        # External links *should* be last section but might not be
+        if re.search("== *External links *== *\n(.|\n)*\n==[^=]", text, flags=re.IGNORECASE):
+            external_links_last = False
         insert_text = "\n" + new_entry
     
-    text = insert_end_of_last_section(site, text, insert_text)
+    if external_links_last:
+        text = insert_end_of_last_section(site, text, insert_text)
+    else:
+        text = insert_end_of_not_last_section(text, 'External links', insert_text)
+    
     # Ensure blank line after new text (assume doesn't occur elsewhere)
     while not insert_text + "\n\n" in text:
         text = text.replace(insert_text, insert_text + "\n")
@@ -153,11 +191,31 @@ username = config.get('mwclient', 'username')
 password = config.get('mwclient', 'password')
 site.login(username, password)
 
+jumped = False
+
 for artist in artists:
     artist_name = fix_case(artist['name'])
-    artist_article = get_redirect(site, artist_name)
+    artist_article = None
+    for suffix in [' (band)',
+                   ' (group)',
+                   ' (musician)',
+                   ' (entertainer)',
+                   ' (singer)',
+                   ' (artist)',
+                   ' (boy band)',
+                   ' (rock band)',
+                   ' (US band)',
+                   ' (U.S. band)',
+                   ' (girl group)',
+                   ' (American group)',
+                   ' (R&B group)',
+                   '']:
+        if artist_article is None:
+            artist_article = get_redirect(site, artist_name + suffix)
+
     if artist_article is None:
         print 'Could not find article on artist ' + artist['name']
+        artist_article = ""
     else:
         print 'Guess at artist article: ' + artist_article
         if is_disambiguation_page(site, artist_article):
@@ -173,42 +231,52 @@ for artist in artists:
     songs = [{'url': x['href'][1:], 'title': re.sub(r' Lyrics$', '', x.text.strip())} for x in song_links]
 
     for song in songs:
+        if song['title'] == 'Black Soul Choir':
+            jumped = True
+        if not jumped:
+            continue
+
         song_result_cache_path = 'cache/' + song['url'] + '.result'
         if songs_complete.has_key(song['url']):
             continue
 
-        response = urllib2.urlopen('http://www.metrolyrics.com/' + song['url'])
-        html = response.read()
-        if 'Our licensing agreement does not allow' in html:
-            songs_complete[song['url']] = 0
-            with open(songs_complete_cache_path, 'w') as f:
-                pickle.dump(songs_complete, f)
-            print 'MetroLyrics does not currently have lyrics of ' + song['title']
-            time.sleep(5)
-            continue
-
         title = fix_case(song['title'])
         song_article = None
-        for suffix in [' (' + artist['name'] + ' song)',
-                       ' (' + artist_article + ' song)',
-                       ' (' + artist['name'] + ')',
-                       ' (' + artist_article + ')',
-                       ' (song)',
-                       '']:
-            if song_article is None:
-                song_article = get_redirect(site, title + suffix)
-            if song_article is None:
-                song_article = get_redirect(site, 'The ' + title + suffix)
+        song_article_no_suffix = get_redirect(site, title)
+        if song_article_no_suffix is not None:
+            for suffix in [' (' + artist['name'] + ' song)',
+                           ' (' + artist_article + ' song)',
+                           ' (' + artist['name'] + ')',
+                           ' (' + artist_article + ')',
+                           ' (song)']:
+                if song_article is None:
+                    song_article = get_redirect(site, title + suffix)
+                    break
+                if song_article is None:
+                    song_article = get_redirect(site, 'The ' + title + suffix)
+                    break
+        if song_article is None:
+            song_article = song_article_no_suffix
 
         if song_article is None:
             print 'Could not find article on song ' + title
         else:
+            response = urllib2.urlopen('http://www.metrolyrics.com/' + song['url'])
+            html = response.read()
+            if 'Our licensing agreement does not allow' in html:
+                songs_complete[song['url']] = 0
+                with open(songs_complete_cache_path, 'w') as f:
+                    pickle.dump(songs_complete, f)
+                print 'MetroLyrics does not currently have lyrics of ' + song['title']
+                time.sleep(5)
+                continue
+
             print 'Guess at song article: ' + song_article
             if is_disambiguation_page(site, song_article):
                 print 'WARNING: ' + song_article + ' is disambiguation page'
             elif not is_song(site, song_article):
                 print 'WARNING: Could not verify is song article'
-            elif not confirm_song(site, song_article, artist_article):
+            elif not confirm_song(site, song_article, artist_article, artist_name):
                 print 'WARNING: Could not confirm is correct song article'
             else:
                 print 'Confirmed is song'
@@ -219,19 +287,25 @@ for artist in artists:
                     title_url = m.group(1)
                     artist_url = m.group(2)
                     page = site.Pages[song_article]
-                    if not has_edited_before(page, 'LyricsBot'):
+                    if has_edited_before(page, 'LyricsBot'):
+                        print "LyricsBot has already edited this page before"
+                        songs_complete[song['url']] = 2
+                    else:
                         text = page.edit()
                         if not allow_bots(text, 'LyricsBot'):
                             print "LyricsBot forbidden on song page"
+                            songs_complete[song['url']] = 3
                         elif '{{MetroLyrics' in text or 'metrolyrics.com/' in text:
                             print "Already contains MetroLyrics link"
+                            songs_complete[song['url']] = 4
                         else:
-                            text = add_to_external_links(site, text, '* {{MetroLyrics song|' + artist_url + '|' + title_url + '}}')
-                            page.save(text, summary="Add external link to full lyrics from licensed provider (MetroLyrics)")
+                            text = add_to_external_links(site, text, '* {{MetroLyrics song|' + artist_url + '|' + title_url + '}}<!-- Licensed lyrics provider -->')
+                            page.save(text, summary="Add external link to full lyrics from licensed provider (MetroLyrics) - please report incorrect links at [[User talk:Dcoetzee]]")
                             print "Inserted external link in [[" + song_article + "]]"
                             songs_complete[song['url']] = 1
                             with open(songs_complete_cache_path, 'w') as f:
                                 pickle.dump(songs_complete, f)
-                    sys.exit(0)
+                    with open(songs_complete_cache_path, 'w') as f:
+                        pickle.dump(songs_complete, f)
 
         time.sleep(5)
